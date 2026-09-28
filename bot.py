@@ -51,6 +51,10 @@ migration_watch = {}
 migration_tx_cache = {}
 last_migration_signature = None
 last_discovery_stats = {"migration": 0, "dex": 0}
+last_rejection_stats = {}
+live_feed_chats = set()
+trade_events = []
+MAX_TRADE_EVENTS = 20
 
 
 def _redact_secret(value):
@@ -104,6 +108,41 @@ def send_message(chat_id, text):
 def broadcast(text):
     for chat_id in list(known_chats):
         send_message(chat_id, text)
+
+
+def record_trade_event(text):
+    trade_events.append({"time": time.time(), "text": text})
+    if len(trade_events) > MAX_TRADE_EVENTS:
+        del trade_events[:-MAX_TRADE_EVENTS]
+
+
+def broadcast_live(text):
+    record_trade_event(text)
+    for chat_id in list(live_feed_chats):
+        send_message(chat_id, text)
+
+
+def live_text():
+    lines = [
+        "🟢 LIVE PAPER TRADE FEED",
+        "Automatic paper entry/exit alerts are ON for this chat.",
+        f"Open paper positions: {len(open_positions)}/{MAX_OPEN}",
+    ]
+    if not trade_events:
+        lines.append("No paper trades have triggered yet.")
+        return "\n".join(lines)
+
+    lines.append("Recent paper trades:")
+    now = time.time()
+    for event in trade_events[-6:][::-1]:
+        age_s = max(0, int(now - event.get("time", now)))
+        if age_s < 60:
+            age = f"{age_s}s ago"
+        else:
+            age = f"{age_s // 60}m ago"
+        first_line = str(event.get("text") or "paper trade").splitlines()[0]
+        lines.append(f"• {age} — {first_line}")
+    return "\n".join(lines)
 
 
 def rpc(method, params):
@@ -465,32 +504,61 @@ def check_exits():
             position["closed_at"] = time.time()
             closed_positions.append(position)
             open_positions.pop(mint, None)
-            broadcast(
+            event_text = (
                 "🎯 PAPER TARGET HIT\n"
                 f"{position['symbol']} ({mint[:6]}…{mint[-4:]})\n"
                 f"Net P&L: +{pnl:.4f} SOL\n"
                 "No real trade was placed."
             )
+            broadcast_live(event_text)
+
+
+def _count_rejection(stats, reason):
+    stats[reason] = stats.get(reason, 0) + 1
+
+
+def _safety_rejection_label(reason):
+    text = str(reason or "on-chain safety failure")
+    if "mint authority active" in text:
+        return "mint authority active"
+    if "freeze authority active" in text:
+        return "freeze authority active"
+    if "holder concentration" in text:
+        return "holder concentration too high"
+    if "holder data unavailable" in text:
+        return "holder data unavailable"
+    if "mint data unavailable" in text:
+        return "mint data unavailable"
+    if "unsafe extension" in text:
+        return "unsafe token extension"
+    if "invalid token supply" in text:
+        return "invalid token supply"
+    if "holder parse failure" in text:
+        return "holder data parse failure"
+    return "on-chain safety failure"
 
 
 def run_scan():
-    global candidates, last_scan_at
+    global candidates, last_scan_at, last_rejection_stats
     last_scan_at = time.time()
     check_exits()
 
     qualified = []
     rejected = 0
+    rejection_stats = {}
 
     for mint in discover_mints():
         # On-chain migration-watch mints are verified through the official Pump program,
         # PumpSwap program, and migration account. DexScreener fallback mints must still
         # carry the conventional pump.fun suffix before they are considered.
         if mint not in migration_watch and not mint.lower().endswith("pump"):
+            _count_rejection(rejection_stats, "not verified Pump.fun origin")
             rejected += 1
             continue
 
         pair = best_pumpswap_pair(mint)
         if not pair:
+            _count_rejection(rejection_stats, "no PumpSwap/SOL pair")
             rejected += 1
             continue
 
@@ -498,28 +566,42 @@ def run_scan():
             price = float(pair.get("priceNative") or 0)
             liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
         except Exception:
+            _count_rejection(rejection_stats, "invalid market data")
             rejected += 1
             continue
 
-        if price <= 0 or liquidity < MIN_LIQUIDITY_USD:
+        if price <= 0:
+            _count_rejection(rejection_stats, "invalid price")
+            rejected += 1
+            continue
+        if liquidity < MIN_LIQUIDITY_USD:
+            _count_rejection(rejection_stats, "low liquidity")
             rejected += 1
             continue
 
         social_score, market_score, age_min = market_scores(pair)
-        if (
-            age_min < MIN_PAIR_AGE_MIN
-            or social_score < SOCIAL_MIN
-            or market_score < MARKET_MIN
-        ):
+        if age_min < MIN_PAIR_AGE_MIN:
+            _count_rejection(rejection_stats, "pair too new")
+            rejected += 1
+            continue
+        if social_score < SOCIAL_MIN:
+            _count_rejection(rejection_stats, "weak/missing socials")
+            rejected += 1
+            continue
+        if market_score < MARKET_MIN:
+            _count_rejection(rejection_stats, "weak market activity")
             rejected += 1
             continue
 
         safety, reason = onchain_safety(mint)
         if not safety:
+            label = _safety_rejection_label(reason)
+            _count_rejection(rejection_stats, label)
             print(f"REJECT {mint}: {reason}", flush=True)
             rejected += 1
             continue
         if safety["risk"] > RISK_MAX:
+            _count_rejection(rejection_stats, "risk score too high")
             rejected += 1
             continue
 
@@ -548,7 +630,7 @@ def run_scan():
                 "target_price": price * TARGET_MULTIPLIER,
                 "opened_at": time.time(),
             }
-            broadcast(
+            event_text = (
                 "🧪 PAPER ENTRY\n"
                 f"{symbol} ({mint[:6]}…{mint[-4:]})\n"
                 f"Size: {POSITION_SOL:.2f} SOL simulated\n"
@@ -558,17 +640,39 @@ def run_scan():
                 f"(~{(TARGET_MULTIPLIER-1)*100:.1f}% modeled market move)\n"
                 "NO wallet or real order used."
             )
+            broadcast_live(event_text)
 
     qualified.sort(
         key=lambda x: (x["trigger"], x["market"], x["social"], -x["risk"]),
         reverse=True,
     )
     candidates = qualified[:8]
+    last_rejection_stats = dict(
+        sorted(rejection_stats.items(), key=lambda item: (-item[1], item[0]))
+    )
+    breakdown = ", ".join(
+        f"{reason}={count}" for reason, count in list(last_rejection_stats.items())[:6]
+    ) or "none"
     print(
-        f"SCAN qualified={len(qualified)} rejected={rejected} open={len(open_positions)}",
+        f"SCAN qualified={len(qualified)} rejected={rejected} open={len(open_positions)} "
+        f"reasons=[{breakdown}]",
         flush=True,
     )
     return len(qualified), rejected
+
+
+def rejections_text():
+    if not last_scan_at:
+        return "No scan has run yet, so there is no rejection breakdown."
+    if not last_rejection_stats:
+        return "Last scan had no rejected candidates."
+
+    total = sum(last_rejection_stats.values())
+    lines = [f"Last scan rejection breakdown ({total} total):"]
+    for reason, count in last_rejection_stats.items():
+        pct = (100.0 * count / total) if total else 0.0
+        lines.append(f"• {reason}: {count} ({pct:.0f}%)")
+    return "\n".join(lines)
 
 
 def status_text():
@@ -665,7 +769,9 @@ def handle_message(chat_id, text):
             "/status - scanner health\n"
             "/scan - run a scan now\n"
             "/candidates - qualified watchlist\n"
+            "/rejections - last scan rejection breakdown\n"
             "/migrations - recent verified graduates\n"
+            "/live - live paper trade feed (/live off to stop)\n"
             "/positions - open paper positions\n"
             "/performance - paper results\n"
             "/pause - pause auto scanning\n"
@@ -677,8 +783,22 @@ def handle_message(chat_id, text):
         send_message(chat_id, status_text())
     elif command == "/candidates":
         send_message(chat_id, candidates_text())
+    elif command == "/rejections":
+        send_message(chat_id, rejections_text())
     elif command == "/migrations":
         send_message(chat_id, migrations_text())
+    elif command == "/live":
+        parts = raw.split()
+        option = parts[1].lower() if len(parts) > 1 else "on"
+        if option in {"off", "stop", "0"}:
+            live_feed_chats.discard(chat_id)
+            send_message(chat_id, "⚪ LIVE PAPER TRADE FEED OFF.")
+        elif option == "status":
+            state = "ON" if chat_id in live_feed_chats else "OFF"
+            send_message(chat_id, f"Live paper trade feed: {state}.")
+        else:
+            live_feed_chats.add(chat_id)
+            send_message(chat_id, live_text())
     elif command == "/positions":
         send_message(chat_id, positions_text())
     elif command == "/performance":
@@ -695,6 +815,8 @@ def handle_message(chat_id, text):
         send_message(
             chat_id,
             f"Scan complete. Qualified: {qualified}. Rejected: {rejected}.\n\n"
+            + rejections_text()
+            + "\n\n"
             + candidates_text(),
         )
     elif command == "/id":
