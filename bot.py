@@ -11,6 +11,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 DEX_API = "https://api.dexscreener.com"
 SOLANA_RPC = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 WSOL = "So11111111111111111111111111111111111111112"
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+PUMP_MIGRATION_ACCOUNT = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
 
 POSITION_SOL = float(os.getenv("PAPER_POSITION_SOL", "0.10"))
 NET_TARGET = float(os.getenv("NET_TARGET_PCT", "10")) / 100.0
@@ -26,6 +29,9 @@ REBOUND = float(os.getenv("REBOUND_PCT", "3")) / 100.0
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "25000"))
 MIN_PAIR_AGE_MIN = float(os.getenv("MIN_PAIR_AGE_MIN", "10"))
+MIGRATION_WATCH_MIN = float(os.getenv("MIGRATION_WATCH_MIN", "180"))
+MIGRATION_SIGNATURE_LIMIT = int(os.getenv("MIGRATION_SIGNATURE_LIMIT", "8"))
+DISCOVERY_LIMIT = int(os.getenv("DISCOVERY_LIMIT", "24"))
 
 # Market-price multiplier needed to net NET_TARGET after modeled entry/exit costs.
 TARGET_MULTIPLIER = (
@@ -41,6 +47,10 @@ open_positions = {}
 closed_positions = []
 candidates = []
 last_scan_at = 0.0
+migration_watch = {}
+migration_tx_cache = {}
+last_migration_signature = None
+last_discovery_stats = {"migration": 0, "dex": 0}
 
 
 def http_json(url, data=None, headers=None, timeout=25):
@@ -164,22 +174,156 @@ def onchain_safety(mint):
     return {"risk": risk, "top1": top1, "top10": top10}, None
 
 
-def discover_mints(limit=20):
+def _account_pubkeys(tx):
+    message = (((tx or {}).get("transaction") or {}).get("message") or {})
+    keys = set()
+    for item in message.get("accountKeys") or []:
+        if isinstance(item, dict):
+            pubkey = item.get("pubkey")
+        else:
+            pubkey = item
+        if pubkey:
+            keys.add(str(pubkey))
+    for ix in message.get("instructions") or []:
+        if isinstance(ix, dict) and ix.get("programId"):
+            keys.add(str(ix["programId"]))
+    meta = (tx or {}).get("meta") or {}
+    for group in meta.get("innerInstructions") or []:
+        for ix in (group or {}).get("instructions") or []:
+            if isinstance(ix, dict) and ix.get("programId"):
+                keys.add(str(ix["programId"]))
+    return keys
+
+
+def _migration_mints_from_tx(tx):
+    """Return token mints from a verified Pump.fun -> PumpSwap migration tx."""
+    keys = _account_pubkeys(tx)
+    if PUMP_PROGRAM not in keys or PUMPSWAP_PROGRAM not in keys:
+        return []
+
+    meta = (tx or {}).get("meta") or {}
+    mints = []
+    seen = set()
+    for item in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+        mint = item.get("mint") if isinstance(item, dict) else None
+        if mint and mint != WSOL and mint not in seen:
+            seen.add(mint)
+            mints.append(mint)
+    return mints
+
+
+def refresh_migration_watch():
+    """Poll the official Pump.fun migration account and retain recent graduates."""
+    global last_migration_signature
+
+    options = {"limit": max(1, min(MIGRATION_SIGNATURE_LIMIT, 50)), "commitment": "confirmed"}
+    if last_migration_signature:
+        options["until"] = last_migration_signature
+
+    rows = rpc("getSignaturesForAddress", [PUMP_MIGRATION_ACCOUNT, options])
+    if not isinstance(rows, list):
+        return 0
+
+    now = time.time()
+    added = 0
+    for row in reversed(rows):
+        if not isinstance(row, dict) or row.get("err"):
+            continue
+        signature = row.get("signature")
+        if not signature:
+            continue
+
+        mints = migration_tx_cache.get(signature)
+        if mints is None:
+            tx = rpc(
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            )
+            mints = _migration_mints_from_tx(tx) if tx else []
+            migration_tx_cache[signature] = mints
+
+        block_time = float(row.get("blockTime") or now)
+        for mint in mints:
+            current = migration_watch.get(mint)
+            if current is None or block_time > current.get("block_time", 0):
+                migration_watch[mint] = {
+                    "block_time": block_time,
+                    "signature": signature,
+                }
+                added += 1
+
+    if rows and isinstance(rows[0], dict) and rows[0].get("signature"):
+        last_migration_signature = rows[0]["signature"]
+
+    cutoff = now - MIGRATION_WATCH_MIN * 60.0
+    for mint, data in list(migration_watch.items()):
+        if data.get("block_time", 0) < cutoff:
+            migration_watch.pop(mint, None)
+
+    # Bound caches in long-running containers.
+    if len(migration_tx_cache) > 250:
+        keep = {d.get("signature") for d in migration_watch.values()}
+        for sig in list(migration_tx_cache):
+            if sig not in keep:
+                migration_tx_cache.pop(sig, None)
+            if len(migration_tx_cache) <= 150:
+                break
+
+    return added
+
+
+def discover_mints(limit=None):
+    """Prefer verified on-chain Pump.fun graduates, then use DexScreener as fallback."""
+    global last_discovery_stats
+    limit = DISCOVERY_LIMIT if limit is None else limit
     out = []
     seen = set()
-    for endpoint in ("token-boosts/latest/v1", "token-profiles/latest/v1"):
-        data = http_json(f"{DEX_API}/{endpoint}", timeout=15)
-        if not isinstance(data, list):
-            continue
-        for item in data:
-            mint = item.get("tokenAddress")
-            if item.get("chainId") == "solana" and mint and mint not in seen:
-                seen.add(mint)
-                out.append(mint)
-            if len(out) >= limit:
-                break
+
+    refresh_migration_watch()
+    recent = sorted(
+        migration_watch.items(),
+        key=lambda item: item[1].get("block_time", 0),
+        reverse=True,
+    )
+    for mint, _ in recent:
+        if mint not in seen:
+            seen.add(mint)
+            out.append(mint)
         if len(out) >= limit:
             break
+    migration_count = len(out)
+
+    if len(out) < limit:
+        for endpoint in ("token-boosts/latest/v1", "token-profiles/latest/v1"):
+            data = http_json(f"{DEX_API}/{endpoint}", timeout=15)
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                mint = item.get("tokenAddress")
+                if (
+                    item.get("chainId") == "solana"
+                    and mint
+                    and mint not in seen
+                    and mint.lower().endswith("pump")
+                ):
+                    seen.add(mint)
+                    out.append(mint)
+                if len(out) >= limit:
+                    break
+            if len(out) >= limit:
+                break
+
+    last_discovery_stats = {
+        "migration": migration_count,
+        "dex": max(0, len(out) - migration_count),
+    }
     return out
 
 
@@ -331,9 +475,10 @@ def run_scan():
     rejected = 0
 
     for mint in discover_mints():
-        # Pump.fun mints conventionally end in "pump". This is only a candidate gate,
-        # not proof of origin or safety.
-        if not mint.lower().endswith("pump"):
+        # On-chain migration-watch mints are verified through the official Pump program,
+        # PumpSwap program, and migration account. DexScreener fallback mints must still
+        # carry the conventional pump.fun suffix before they are considered.
+        if mint not in migration_watch and not mint.lower().endswith("pump"):
             rejected += 1
             continue
 
@@ -430,6 +575,9 @@ def status_text():
         f"Modeled costs: {FEE_SIDE*100:.2f}% fee + "
         f"{SLIPPAGE_SIDE*100:.2f}% slippage per side\n"
         f"Open paper positions: {len(open_positions)}/{MAX_OPEN}\n"
+        f"Verified migration watch: {len(migration_watch)}\n"
+        f"Discovery last scan: {last_discovery_stats['migration']} migration + "
+        f"{last_discovery_stats['dex']} fallback\n"
         f"Last scan: {age}"
     )
 
@@ -446,6 +594,22 @@ def candidates_text():
         )
     return "\n".join(lines)
 
+
+
+def migrations_text():
+    if not migration_watch:
+        return "No verified Pump.fun migrations in the current watch window yet."
+    rows = sorted(
+        migration_watch.items(),
+        key=lambda item: item[1].get("block_time", 0),
+        reverse=True,
+    )[:8]
+    lines = ["Verified Pump.fun → PumpSwap graduates:"]
+    now = time.time()
+    for mint, data in rows:
+        age_min = max(0, int((now - data.get("block_time", now)) / 60))
+        lines.append(f"{mint[:6]}…{mint[-6:]} | {age_min}m ago")
+    return "\n".join(lines)
 
 def positions_text():
     if not open_positions:
@@ -494,6 +658,7 @@ def handle_message(chat_id, text):
             "/status - scanner health\n"
             "/scan - run a scan now\n"
             "/candidates - qualified watchlist\n"
+            "/migrations - recent verified graduates\n"
             "/positions - open paper positions\n"
             "/performance - paper results\n"
             "/pause - pause auto scanning\n"
@@ -505,6 +670,8 @@ def handle_message(chat_id, text):
         send_message(chat_id, status_text())
     elif command == "/candidates":
         send_message(chat_id, candidates_text())
+    elif command == "/migrations":
+        send_message(chat_id, migrations_text())
     elif command == "/positions":
         send_message(chat_id, positions_text())
     elif command == "/performance":
