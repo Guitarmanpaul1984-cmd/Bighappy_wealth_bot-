@@ -53,6 +53,13 @@ last_migration_signature = None
 last_discovery_stats = {"migration": 0, "dex": 0}
 
 
+def _redact_secret(value):
+    text = str(value)
+    if TOKEN:
+        text = text.replace(TOKEN, "<redacted>")
+    return text
+
+
 def http_json(url, data=None, headers=None, timeout=25):
     merged = {
         "User-Agent": "BigHappyWealthBot/3.0",
@@ -66,9 +73,9 @@ def http_json(url, data=None, headers=None, timeout=25):
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
-        print(f"HTTP {e.code} {url}: {body[:300]}", flush=True)
+        print(f"HTTP {e.code} {_redact_secret(url)}: {_redact_secret(body[:300])}", flush=True)
     except Exception as e:
-        print(f"HTTP ERROR {type(e).__name__}: {e}", flush=True)
+        print(f"HTTP ERROR {type(e).__name__}: {_redact_secret(e)}", flush=True)
     return None
 
 
