@@ -21,14 +21,14 @@ FEE_SIDE = float(os.getenv("SIM_FEE_PCT_SIDE", "1.25")) / 100.0
 SLIPPAGE_SIDE = float(os.getenv("SIM_SLIPPAGE_PCT_SIDE", "0.80")) / 100.0
 MAX_OPEN = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 RISK_MAX = int(os.getenv("RISK_MAX", "20"))
-SOCIAL_MIN = int(os.getenv("SOCIAL_MIN", "55"))
-MARKET_MIN = int(os.getenv("MARKET_MIN", "65"))
-DIP_MIN = float(os.getenv("DIP_MIN_PCT", "15")) / 100.0
-DIP_MAX = float(os.getenv("DIP_MAX_PCT", "35")) / 100.0
-REBOUND = float(os.getenv("REBOUND_PCT", "3")) / 100.0
+SOCIAL_MIN = int(os.getenv("SOCIAL_MIN", "0"))
+MARKET_MIN = int(os.getenv("MARKET_MIN", "35"))
+DIP_MIN = float(os.getenv("DIP_MIN_PCT", "8")) / 100.0
+DIP_MAX = float(os.getenv("DIP_MAX_PCT", "50")) / 100.0
+REBOUND = float(os.getenv("REBOUND_PCT", "1")) / 100.0
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "25000"))
-MIN_PAIR_AGE_MIN = float(os.getenv("MIN_PAIR_AGE_MIN", "10"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "7500"))
+MIN_PAIR_AGE_MIN = float(os.getenv("MIN_PAIR_AGE_MIN", "2"))
 MIGRATION_WATCH_MIN = float(os.getenv("MIGRATION_WATCH_MIN", "180"))
 MIGRATION_SIGNATURE_LIMIT = int(os.getenv("MIGRATION_SIGNATURE_LIMIT", "8"))
 DISCOVERY_LIMIT = int(os.getenv("DISCOVERY_LIMIT", "24"))
@@ -689,6 +689,9 @@ def status_text():
         f"Verified migration watch: {len(migration_watch)}\n"
         f"Discovery last scan: {last_discovery_stats['migration']} migration + "
         f"{last_discovery_stats['dex']} fallback\n"
+        f"Filters: liq ${MIN_LIQUIDITY_USD:,.0f}+ | age {MIN_PAIR_AGE_MIN:g}m+ | "
+        f"social {SOCIAL_MIN}+ | market {MARKET_MIN}+\n"
+        f"Motion: dip {DIP_MIN*100:.0f}-{DIP_MAX*100:.0f}% | rebound {REBOUND*100:.1f}%\n"
         f"Last scan: {age}"
     )
 
@@ -774,8 +777,10 @@ def handle_message(chat_id, text):
             "/live - live paper trade feed (/live off to stop)\n"
             "/positions - open paper positions\n"
             "/performance - paper results\n"
-            "/pause - pause auto scanning\n"
-            "/resume - resume auto scanning\n"
+            "/off - stop paper scanning (bot stays online for /on)\n"
+            "/on - run paper scanner 24/7\n"
+            "/pause - alias for /off\n"
+            "/resume - alias for /on\n"
             "/id - your chat ID\n"
             "/help - this menu",
         )
@@ -803,12 +808,18 @@ def handle_message(chat_id, text):
         send_message(chat_id, positions_text())
     elif command == "/performance":
         send_message(chat_id, performance_text())
-    elif command == "/pause":
+    elif command in {"/off", "/pause"}:
         auto_scan_enabled = False
-        send_message(chat_id, "Auto scanner PAUSED. Paper mode only.")
-    elif command == "/resume":
+        send_message(
+            chat_id,
+            "🔴 BOT OFF — paper scanning stopped. Telegram control stays online so /on can restart it.",
+        )
+    elif command in {"/on", "/resume"}:
         auto_scan_enabled = True
-        send_message(chat_id, "Auto scanner RUNNING. Paper mode only.")
+        send_message(
+            chat_id,
+            f"🟢 BOT ON — paper scanner running 24/7 every {SCAN_SECONDS}s while Railway is online.",
+        )
     elif command == "/scan":
         send_message(chat_id, "Running a paper scan now…")
         qualified, rejected = run_scan()
