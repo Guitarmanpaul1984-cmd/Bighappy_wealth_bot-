@@ -16,11 +16,12 @@ PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMP_MIGRATION_ACCOUNT = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
 
 POSITION_SOL = float(os.getenv("PAPER_POSITION_SOL", "0.10"))
+PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE_SOL", "1.00"))
 NET_TARGET = float(os.getenv("NET_TARGET_PCT", "10")) / 100.0
 FEE_SIDE = float(os.getenv("SIM_FEE_PCT_SIDE", "1.25")) / 100.0
 SLIPPAGE_SIDE = float(os.getenv("SIM_SLIPPAGE_PCT_SIDE", "0.80")) / 100.0
 MAX_OPEN = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-RISK_MAX = int(os.getenv("RISK_MAX", "20"))
+RISK_MAX = int(os.getenv("RISK_MAX", "35"))
 SOCIAL_MIN = int(os.getenv("SOCIAL_MIN", "0"))
 MARKET_MIN = int(os.getenv("MARKET_MIN", "35"))
 DIP_MIN = float(os.getenv("DIP_MIN_PCT", "8")) / 100.0
@@ -192,7 +193,10 @@ def onchain_safety(mint):
     supply = rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
     largest = rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
     if not supply or not largest:
-        return None, "holder data unavailable"
+        # PAPER MODE ONLY: a rate-limited public RPC should not block every simulated trade.
+        # Keep a heavy risk penalty so unknown holder concentration ranks worse, while
+        # still allowing the strategy to collect paper-trading data.
+        return {"risk": 30, "top1": None, "top10": None, "holder_unknown": True}, "holder data unavailable (soft pass)"
 
     try:
         total = int(supply["value"]["amount"])
@@ -208,13 +212,13 @@ def onchain_safety(mint):
     except Exception:
         return None, "holder parse failure"
 
-    if top1 > 35 or top10 > 80:
+    if top1 > 45 or top10 > 90:
         return None, f"holder concentration {top1:.1f}/{top10:.1f}%"
 
     risk = 0
-    if top1 > 20:
+    if top1 > 25:
         risk += 15
-    if top10 > 60:
+    if top10 > 70:
         risk += 10
 
     return {"risk": risk, "top1": top1, "top10": top10}, None
@@ -504,13 +508,20 @@ def check_exits():
             position["closed_at"] = time.time()
             closed_positions.append(position)
             open_positions.pop(mint, None)
+            total_realized = sum(p.get("pnl_sol", 0) for p in closed_positions)
+            paper_balance = PAPER_STARTING_BALANCE + total_realized
             event_text = (
-                "🎯 PAPER TARGET HIT\n"
+                "💰 PAPER PROFIT MADE\n"
                 f"{position['symbol']} ({mint[:6]}…{mint[-4:]})\n"
-                f"Net P&L: +{pnl:.4f} SOL\n"
+                f"Profit: +{pnl:.4f} SOL\n"
+                f"Paper balance: {paper_balance:.4f} SOL\n"
                 "No real trade was placed."
             )
             broadcast_live(event_text)
+            # Profit notifications go to every chat that has interacted with the bot,
+            # even if /live is off. Avoid duplicates for /live subscribers.
+            for chat_id in list(known_chats - live_feed_chats):
+                send_message(chat_id, event_text)
 
 
 def _count_rejection(stats, reason):
@@ -686,6 +697,7 @@ def status_text():
         f"Modeled costs: {FEE_SIDE*100:.2f}% fee + "
         f"{SLIPPAGE_SIDE*100:.2f}% slippage per side\n"
         f"Open paper positions: {len(open_positions)}/{MAX_OPEN}\n"
+        f"Safety mode: PAPER-LOOSENED (RPC holder failures = risk penalty, not auto-reject)\n"
         f"Verified migration watch: {len(migration_watch)}\n"
         f"Discovery last scan: {last_discovery_stats['migration']} migration + "
         f"{last_discovery_stats['dex']} fallback\n"
@@ -749,6 +761,22 @@ def performance_text():
     )
 
 
+def balance_text():
+    realized = sum(p.get("pnl_sol", 0) for p in closed_positions)
+    invested = sum(p.get("size_sol", 0) for p in open_positions.values())
+    bankroll = PAPER_STARTING_BALANCE + realized
+    available = bankroll - invested
+    return (
+        "💰 PAPER BALANCE\n"
+        f"Starting bankroll: {PAPER_STARTING_BALANCE:.4f} SOL\n"
+        f"Available: {available:.4f} SOL\n"
+        f"In open positions: {invested:.4f} SOL\n"
+        f"Realized P&L: {realized:+.4f} SOL\n"
+        f"Open positions: {len(open_positions)}/{MAX_OPEN}\n"
+        "Simulated balance only — no wallet funds are used."
+    )
+
+
 def handle_message(chat_id, text):
     global auto_scan_enabled
     known_chats.add(chat_id)
@@ -777,6 +805,7 @@ def handle_message(chat_id, text):
             "/live - live paper trade feed (/live off to stop)\n"
             "/positions - open paper positions\n"
             "/performance - paper results\n"
+            "/balance - simulated SOL bankroll\n"
             "/off - stop paper scanning (bot stays online for /on)\n"
             "/on - run paper scanner 24/7\n"
             "/pause - alias for /off\n"
@@ -808,6 +837,8 @@ def handle_message(chat_id, text):
         send_message(chat_id, positions_text())
     elif command == "/performance":
         send_message(chat_id, performance_text())
+    elif command == "/balance":
+        send_message(chat_id, balance_text())
     elif command in {"/off", "/pause"}:
         auto_scan_enabled = False
         send_message(
