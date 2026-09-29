@@ -1,4 +1,5 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY bot.py /app/bot.py
-CMD ["python", "-u", "/app/bot.py"]
+RUN pip install --no-cache-dir solders
+COPY . /app
+CMD ["python", "-u", "/app/live_overlay.py"]
