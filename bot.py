@@ -33,6 +33,7 @@ MIN_PAIR_AGE_MIN = float(os.getenv("MIN_PAIR_AGE_MIN", "2"))
 MIGRATION_WATCH_MIN = float(os.getenv("MIGRATION_WATCH_MIN", "180"))
 MIGRATION_SIGNATURE_LIMIT = int(os.getenv("MIGRATION_SIGNATURE_LIMIT", "8"))
 DISCOVERY_LIMIT = int(os.getenv("DISCOVERY_LIMIT", "24"))
+PAPER_TEST_MODE_DEFAULT = os.getenv("PAPER_TEST_MODE", "1").strip().lower() not in {"0", "false", "off", "no"}
 
 # Market-price multiplier needed to net NET_TARGET after modeled entry/exit costs.
 TARGET_MULTIPLIER = (
@@ -56,6 +57,7 @@ last_rejection_stats = {}
 live_feed_chats = set()
 trade_events = []
 MAX_TRADE_EVENTS = 20
+paper_test_mode = PAPER_TEST_MODE_DEFAULT
 
 
 def _redact_secret(value):
@@ -168,6 +170,10 @@ def onchain_safety(mint):
         [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}],
     )
     if not account or not account.get("value"):
+        if paper_test_mode:
+            # PAPER TEST MODE ONLY: public RPC rate limits must not prevent
+            # simulated entries. No wallet or real order is ever used.
+            return {"risk": 30, "top1": None, "top10": None, "mint_unknown": True}, "mint data unavailable (test soft pass)"
         return None, "mint data unavailable"
 
     parsed = ((account["value"].get("data") or {}).get("parsed") or {})
@@ -193,10 +199,11 @@ def onchain_safety(mint):
     supply = rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
     largest = rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
     if not supply or not largest:
-        # PAPER MODE ONLY: a rate-limited public RPC should not block every simulated trade.
-        # Keep a heavy risk penalty so unknown holder concentration ranks worse, while
-        # still allowing the strategy to collect paper-trading data.
-        return {"risk": 30, "top1": None, "top10": None, "holder_unknown": True}, "holder data unavailable (soft pass)"
+        if paper_test_mode:
+            # PAPER TEST MODE ONLY: a rate-limited public RPC should not block
+            # simulated trades. Keep a heavy risk penalty for unknown holders.
+            return {"risk": 30, "top1": None, "top10": None, "holder_unknown": True}, "holder data unavailable (test soft pass)"
+        return None, "holder data unavailable"
 
     try:
         total = int(supply["value"]["amount"])
@@ -632,7 +639,8 @@ def run_scan():
         }
         qualified.append(item)
 
-        if trigger and mint not in open_positions and len(open_positions) < MAX_OPEN:
+        entry_trigger = trigger or paper_test_mode
+        if entry_trigger and mint not in open_positions and len(open_positions) < MAX_OPEN:
             open_positions[mint] = {
                 "symbol": symbol,
                 "pair_address": pair.get("pairAddress"),
@@ -647,7 +655,8 @@ def run_scan():
                 f"Size: {POSITION_SOL:.2f} SOL simulated\n"
                 f"Dip: {drop*100:.1f}% | Rebound: {rebound*100:.1f}%\n"
                 f"Scores R/S/M: {safety['risk']}/{social_score}/{market_score}\n"
-                f"Target: {NET_TARGET*100:.0f}% NET "
+                + ("TEST MODE: immediate paper entry (motion confirmation bypassed)\n" if paper_test_mode and not trigger else "")
+                + f"Target: {NET_TARGET*100:.0f}% NET "
                 f"(~{(TARGET_MULTIPLIER-1)*100:.1f}% modeled market move)\n"
                 "NO wallet or real order used."
             )
@@ -697,7 +706,8 @@ def status_text():
         f"Modeled costs: {FEE_SIDE*100:.2f}% fee + "
         f"{SLIPPAGE_SIDE*100:.2f}% slippage per side\n"
         f"Open paper positions: {len(open_positions)}/{MAX_OPEN}\n"
-        f"Safety mode: PAPER-LOOSENED (RPC holder failures = risk penalty, not auto-reject)\n"
+        f"Test mode: {'ON — immediate paper entries' if paper_test_mode else 'OFF — strategy confirmations required'}\n"
+        f"Safety mode: {'TEST-SOFTENED (RPC unavailable = risk penalty)' if paper_test_mode else 'NORMAL PAPER SAFETY'}\n"
         f"Verified migration watch: {len(migration_watch)}\n"
         f"Discovery last scan: {last_discovery_stats['migration']} migration + "
         f"{last_discovery_stats['dex']} fallback\n"
@@ -778,7 +788,7 @@ def balance_text():
 
 
 def handle_message(chat_id, text):
-    global auto_scan_enabled
+    global auto_scan_enabled, paper_test_mode
     known_chats.add(chat_id)
     raw = (text or "").strip()
     command = raw.split()[0].lower() if raw else ""
@@ -806,6 +816,7 @@ def handle_message(chat_id, text):
             "/positions - open paper positions\n"
             "/performance - paper results\n"
             "/balance - simulated SOL bankroll\n"
+            "/testmode on|off|status - fast paper-trade testing\n"
             "/off - stop paper scanning (bot stays online for /on)\n"
             "/on - run paper scanner 24/7\n"
             "/pause - alias for /off\n"
@@ -839,6 +850,17 @@ def handle_message(chat_id, text):
         send_message(chat_id, performance_text())
     elif command == "/balance":
         send_message(chat_id, balance_text())
+    elif command == "/testmode":
+        parts = raw.split()
+        option = parts[1].lower() if len(parts) > 1 else "status"
+        if option in {"on", "1", "start"}:
+            paper_test_mode = True
+            send_message(chat_id, "🧪 PAPER TEST MODE ON — RPC-unavailable safety checks soft-pass with a risk penalty, and qualified pairs can enter immediately without waiting for dip/rebound confirmation. PAPER ONLY; no real orders.")
+        elif option in {"off", "0", "stop"}:
+            paper_test_mode = False
+            send_message(chat_id, "✅ PAPER TEST MODE OFF — normal paper-trading confirmations and safety behavior restored.")
+        else:
+            send_message(chat_id, f"Paper test mode: {'ON' if paper_test_mode else 'OFF'}.")
     elif command in {"/off", "/pause"}:
         auto_scan_enabled = False
         send_message(
