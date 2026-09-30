@@ -1,0 +1,164 @@
+import json, os, time, traceback
+from pathlib import Path
+
+GATE = Path(__file__).with_name("Live_gate.py")
+gate = {"__name__": "big_happy_gate", "__file__": str(GATE)}
+exec(compile(GATE.read_text(encoding="utf-8"), str(GATE), "exec"), gate)
+
+v2 = gate["v2"]
+ns = gate["ns"]
+
+STRATEGY_NAME = "V3 QUALITY MOMENTUM"
+
+PAPER_RISK_PER_TRADE = float(
+    os.getenv("PAPER_RISK_PER_TRADE_PCT", "0.25")
+) / 100.0
+
+MIN_ACCEL = float(os.getenv("PAPER_MIN_VOLUME_ACCEL", "1.00"))
+MIN_POSITIVE_5M = float(
+    os.getenv("PAPER_MIN_5M_MOVE_PCT", "0.50")
+)
+MAX_5M_MOVE = float(
+    os.getenv("PAPER_MAX_5M_MOVE_PCT", "15.0")
+)
+
+CONFIRM_SCANS = int(os.getenv("PAPER_CONFIRM_SCANS", "2"))
+DISCOVERY_SECONDS = int(os.getenv("V3_DISCOVERY_SECONDS", "30"))
+EXIT_SECONDS = int(os.getenv("V3_EXIT_SECONDS", "6"))
+POLL_SECONDS = int(os.getenv("V3_TELEGRAM_POLL_SECONDS", "5"))
+
+MIN_PROFIT_FACTOR = float(
+    os.getenv("PAPER_MIN_PROFIT_FACTOR", "1.20")
+)
+
+quality_seen = {}
+
+_original_base_scan = v2["base_scan"]
+
+# V3 gets a fresh validation history.
+gate["VALIDATION_PATH"] = Path(
+    os.getenv(
+        "PAPER_VALIDATION_PATH_V3",
+        "/data/paper_validation_v3.json",
+    )
+)
+gate["validation"] = []
+gate["load_validation"]()
+
+
+def paper_quality_size():
+    bankroll = max(
+        0.0,
+        float(ns["paper_bankroll_sol"]()),
+    )
+    available = max(
+        0.0,
+        float(ns["available_paper_balance"]()),
+    )
+
+    stop = abs(float(v2["p"]()["stop"]))
+    if stop <= 0:
+        return 0.0
+
+    # Planned stop loss risks about 0.25% of bankroll.
+    risk_sized = (
+        bankroll
+        * PAPER_RISK_PER_TRADE
+        / stop
+    )
+
+    requested = float(
+        ns.get("POSITION_SOL") or 0.0
+    )
+
+    return max(
+        0.0,
+        min(
+            requested,
+            risk_sized,
+            available,
+        ),
+    )
+
+
+def announce(text):
+    try:
+        ns["_announce_trade_event"](text)
+    except Exception:
+        for cid in list(ns.get("known_chats") or []):
+            try:
+                ns["send_message"](cid, text)
+            except Exception:
+                pass
+
+
+def open_quality_paper(item, detail):
+    mint = item["mint"]
+    pair = item["pair"]
+    stats = detail["stats"]
+
+    size = paper_quality_size()
+
+    if size < float(
+        ns.get("MIN_PAPER_TRADE_SOL") or 0.01
+    ):
+        return False
+
+    price = float(pair.get("priceNative") or 0)
+    liquidity = float(
+        (pair.get("liquidity") or {}).get("usd") or 0
+    )
+
+    if price <= 0 or liquidity <= 0:
+        return False
+
+    symbol = item.get("symbol", "?")
+
+    ns["open_positions"][mint] = {
+        "symbol": symbol,
+        "pair_address": pair.get("pairAddress"),
+        "entry_price": price,
+        "size_sol": size,
+        "initial_size_sol": size,
+        "entry_liquidity_usd": liquidity,
+        "target_price": (
+            price * ns["TARGET_MULTIPLIER"]
+        ),
+        "opened_at": time.time(),
+        "peak_price": price,
+        "peak_net_pct": -999.0,
+        "realized_pnl_sol": 0.0,
+        "breakeven_armed": False,
+        "tp1_done": False,
+        "tp2_done": False,
+        "tp3_done": False,
+        "runner_active": False,
+        "strategy": STRATEGY_NAME,
+        "entry_v5": stats["v5"],
+        "entry_v1": stats["v1"],
+        "entry_buys": stats["buys"],
+        "entry_sells": stats["sells"],
+        "entry_ratio": stats["ratio"],
+        "entry_p5": stats["p5"],
+        "entry_age": stats["age"],
+        "entry_accel": stats["accel"],
+    }
+
+    announce(
+        "🧪 V3 QUALITY PAPER ENTRY\n"
+        f"{symbol} ({mint[:6]}…{mint[-4:]})\n"
+        f"Size: {size:.4f} SOL simulated\n"
+        f"Liq: ${stats['liq']:,.0f}\n"
+        f"Vol 5m: ${stats['v5']:,.0f} | "
+        f"1h: ${stats['v1']:,.0f}\n"
+        f"Flow: {stats['buys']} buys / "
+        f"{stats['sells']} sells "
+        f"({stats['ratio']:.2f}x)\n"
+        f"5m move: {stats['p5']:+.1f}% | "
+        f"Accel: {stats['accel']:.2f}x\n"
+        f"Risk/trade: "
+        f"{PAPER_RISK_PER_TRADE*100:.2f}% bankroll\n"
+        "REAL order: OFF"
+    )
+
+    return True
